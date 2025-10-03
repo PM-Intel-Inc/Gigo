@@ -52,6 +52,41 @@ def clean_for_json(obj):
 
 class LSTMCompleteP6Analyzer:
     def __init__(self):
+        # Comprehensive construction sequence phases (in correct order)
+        self.construction_sequence = [
+            'permits_approvals',
+            'site_preparation', 
+            'demolition',
+            'surveying',
+            'excavation',
+            'shoring',
+            'dewatering',
+            'piling',
+            'blinding',
+            'waterproofing_below',
+            'formwork',
+            'rebar',
+            'foundation',
+            'backfilling',
+            'structural_steel',
+            'structural_concrete',
+            'masonry',
+            'roofing',
+            'waterproofing_above',
+            'curtain_wall',
+            'mep_rough',
+            'insulation',
+            'drywall',
+            'flooring',
+            'painting',
+            'mep_finish',
+            'fixtures',
+            'testing',
+            'commissioning',
+            'landscaping',
+            'final_inspection'
+        ]
+        
         # Activity templates for generating training data
         self.activity_templates = {
             'permits_approvals': [
@@ -100,7 +135,7 @@ class LSTMCompleteP6Analyzer:
         self.lstm_model = None
         self.max_sequence_length = 50
         
-        # Correction templates
+        # Comprehensive correction templates for all construction sequences
         self.correction_templates = {
             'permit_after_work': {
                 'reason': 'Permits must be obtained before construction work begins',
@@ -110,6 +145,21 @@ class LSTMCompleteP6Analyzer:
             'foundation_before_excavation': {
                 'reason': 'Foundation work requires completed excavation',
                 'suggestion': 'Schedule after all excavation activities are complete',
+                'priority': 'High'
+            },
+            'formwork_before_excavation': {
+                'reason': 'Formwork and shuttering requires completed excavation',
+                'suggestion': 'Schedule after excavation but before concrete pouring',
+                'priority': 'High'
+            },
+            'backfilling_before_foundation': {
+                'reason': 'Backfilling can only occur after foundation work is complete',
+                'suggestion': 'Schedule after all foundation and concrete work',
+                'priority': 'High'
+            },
+            'hvac_before_structure': {
+                'reason': 'HVAC ducting installation requires completed structural work',
+                'suggestion': 'Schedule after structural phase and before finishing work',
                 'priority': 'High'
             },
             'testing_before_installation': {
@@ -308,10 +358,21 @@ class LSTMCompleteP6Analyzer:
             'vocab_size': vocab_size
         }
     
-    def analyze_schedule(self, schedule_df):
-        """Analyze uploaded schedule using LSTM"""
+    def analyze_schedule(self, schedule_df, max_batch_size=50):
+        """Analyze uploaded schedule using LSTM with batching for large schedules"""
         if self.lstm_model is None:
             return {'error': 'LSTM model not trained yet'}
+        
+        # Check schedule size
+        num_activities = len(schedule_df)
+        is_large_schedule = num_activities > 100
+        
+        if num_activities > 1000:
+            return {
+                'error': f'Schedule too large: {num_activities} activities',
+                'message': 'Maximum supported schedule size is 1000 activities. Please split your schedule into smaller sections.',
+                'suggestion': 'Consider analyzing critical path activities or breaking the schedule into phases.'
+            }
         
         # Find activity name column
         activity_col = None
@@ -323,7 +384,35 @@ class LSTMCompleteP6Analyzer:
         if not activity_col:
             return {'error': 'Could not find activity name column'}
         
-        activity_texts = schedule_df[activity_col].astype(str).tolist()
+        activity_texts_raw = schedule_df[activity_col].astype(str).tolist()
+        
+        # Check for duplicate activity names
+        duplicates = self._check_duplicates(schedule_df, activity_col)
+        
+        # Handle duplicates by renaming them instead of rejecting
+        activity_texts = []
+        duplicate_counter = {}
+        
+        for i, activity in enumerate(activity_texts_raw):
+            if activity in duplicate_counter:
+                # This is a duplicate - add a counter to make it unique
+                duplicate_counter[activity] += 1
+                renamed_activity = f"{activity} #{duplicate_counter[activity]}"
+                activity_texts.append(renamed_activity)
+            else:
+                # First occurrence or unique activity
+                duplicate_counter[activity] = 1
+                activity_texts.append(activity)
+        
+        # Store duplicate warning info for later inclusion in results
+        duplicate_warning = None
+        if duplicates['has_duplicates']:
+            duplicate_warning = {
+                'has_duplicates': True,
+                'message': 'Warning: Duplicate activity names detected and automatically numbered',
+                'duplicates': duplicates['duplicates'],
+                'total_duplicates': duplicates['duplicate_count']
+            }
         
         # Prepare text features
         sequences = self.tokenizer.texts_to_sequences(activity_texts)
@@ -355,23 +444,53 @@ class LSTMCompleteP6Analyzer:
         numerical_features = np.column_stack([duration, position])
         X_numerical = self.scaler.transform(numerical_features)
         
-        # Make LSTM predictions
-        predictions = self.lstm_model.predict([X_text, X_phase, X_numerical])
+        # Make LSTM predictions with batching for large schedules
+        if num_activities > 100:
+            # Process in batches to avoid memory issues
+            predictions = []
+            batch_size = max_batch_size
+            for i in range(0, num_activities, batch_size):
+                end_idx = min(i + batch_size, num_activities)
+                batch_predictions = self.lstm_model.predict(
+                    [X_text[i:end_idx], X_phase[i:end_idx], X_numerical[i:end_idx]],
+                    verbose=0,
+                    batch_size=32
+                )
+                predictions.append(batch_predictions)
+            predictions = np.vstack(predictions)
+        else:
+            predictions = self.lstm_model.predict([X_text, X_phase, X_numerical], verbose=0)
+        
+        # Perform additional sequence validation
+        sequence_issues = self._validate_construction_sequence(activity_texts, phases)
         
         # Generate results
         results = []
         for i, activity_name in enumerate(activity_texts):
             sequence_prob = float(predictions[i][0])
-            is_incorrect = sequence_prob > 0.5
+            
+            # Check both LSTM prediction and rule-based validation
+            lstm_thinks_incorrect = sequence_prob > 0.5
+            rule_based_issue = i in sequence_issues
+            is_incorrect = lstm_thinks_incorrect or rule_based_issue
+            
             confidence = abs(sequence_prob - 0.5) * 2  # Convert to 0-1 confidence
+            if rule_based_issue:
+                confidence = max(confidence, 0.8)  # High confidence for rule-based issues
             
             activity_id = schedule_df.iloc[i].get('Activity ID', 
                          schedule_df.iloc[i].get('Activity_ID', f'A{i+1:03d}'))
             
+            # Get original activity name (before duplicate renaming)
+            original_activity = activity_texts_raw[i]
+            display_name = activity_name  # This includes the #2, #3 suffix for duplicates
+            
             result = {
                 'sr_no': i + 1,
                 'activity_id': str(activity_id),
-                'task_name': str(activity_name),
+                'task_name': str(display_name),
+                'original_name': str(original_activity),
+                'is_duplicate': display_name != original_activity,
                 'phase': str(phases[i]),
                 'is_correct': bool(not is_incorrect),
                 'confidence': float(confidence),
@@ -384,62 +503,431 @@ class LSTMCompleteP6Analyzer:
                 correction = self._generate_correction(activity_name, phases[i], i + 1)
                 result.update(correction)
                 result['reason'] = correction['correction_reason']
+                if rule_based_issue and i in sequence_issues:
+                    result['reason'] = sequence_issues[i].get('reason', result['reason'])
             else:
                 result['reason'] = 'Activity is properly sequenced within the construction workflow'
             
+            # Add duplicate indicator to reason if it's a duplicate
+            if result['is_duplicate']:
+                result['reason'] = f"[DUPLICATE ACTIVITY] {result['reason']}"
+            
             results.append(result)
         
-        return {
-            'results': results,
-            'summary': {
-                'total_activities': len(results),
-                'issues_found': sum(1 for r in results if not r['is_correct']),
-                'correct_sequences': sum(1 for r in results if r['is_correct']),
-                'accuracy_percentage': (sum(1 for r in results if r['is_correct']) / len(results)) * 100,
-                'model_used': 'LSTM Neural Network'
+        # For large schedules, add pagination info
+        if num_activities > 100:
+            # Only return first 100 results for display, but analyze all
+            display_results = results[:100]
+            response = {
+                'results': display_results,
+                'all_results_count': len(results),
+                'displayed_count': len(display_results),
+                'is_truncated': True,
+                'summary': {
+                    'total_activities': len(results),
+                    'issues_found': sum(1 for r in results if not r['is_correct']),
+                    'correct_sequences': sum(1 for r in results if r['is_correct']),
+                    'accuracy_percentage': (sum(1 for r in results if r['is_correct']) / len(results)) * 100,
+                    'model_used': 'LSTM Neural Network',
+                    'schedule_size': 'Large' if num_activities > 200 else 'Medium'
+                }
             }
+        else:
+            response = {
+                'results': results,
+                'summary': {
+                    'total_activities': len(results),
+                    'issues_found': sum(1 for r in results if not r['is_correct']),
+                    'correct_sequences': sum(1 for r in results if r['is_correct']),
+                    'accuracy_percentage': (sum(1 for r in results if r['is_correct']) / len(results)) * 100,
+                    'model_used': 'LSTM Neural Network'
+                }
+            }
+        
+        # Add duplicate warning if duplicates were found
+        if duplicate_warning:
+            response['duplicate_warning'] = duplicate_warning
+            
+        return response
+    
+    def _validate_construction_sequence(self, activity_texts, phases):
+        """Comprehensive validation of construction sequence based on industry best practices"""
+        issues = {}
+        
+        # Define the master sequence order (from earliest to latest)
+        sequence_priority = {
+            'permits_approvals': 1,
+            'site_preparation': 2,
+            'demolition': 3,
+            'surveying': 4,
+            'excavation': 5,
+            'shoring': 6,
+            'dewatering': 7,
+            'piling': 8,
+            'blinding': 9,
+            'waterproofing_below': 10,
+            'formwork': 11,
+            'rebar': 12,
+            'foundation': 13,
+            'backfilling': 14,
+            'structural_steel': 15,
+            'structural_concrete': 16,
+            'masonry': 17,
+            'roofing': 18,
+            'waterproofing_above': 19,
+            'curtain_wall': 20,
+            'mep_rough': 21,
+            'insulation': 22,
+            'drywall': 23,
+            'flooring': 24,
+            'painting': 25,
+            'mep_finish': 26,
+            'fixtures': 27,
+            'testing': 28,
+            'commissioning': 29,
+            'landscaping': 30,
+            'final_inspection': 31,
+            'unknown': 99
+        }
+        
+        # Track phase positions for dependency checking
+        phase_positions = {}
+        for i, phase in enumerate(phases):
+            if phase not in phase_positions:
+                phase_positions[phase] = []
+            phase_positions[phase].append(i)
+        
+        # Define critical dependencies (phase -> must come after these phases)
+        critical_dependencies = {
+            'foundation': ['excavation', 'piling', 'formwork', 'rebar'],
+            'formwork': ['excavation', 'piling', 'blinding'],
+            'rebar': ['formwork'],
+            'backfilling': ['foundation', 'waterproofing_below'],
+            'structural_concrete': ['foundation', 'structural_steel'],
+            'structural_steel': ['foundation'],
+            'masonry': ['structural_concrete', 'structural_steel'],
+            'roofing': ['structural_concrete', 'structural_steel'],
+            'curtain_wall': ['structural_concrete', 'structural_steel'],
+            'mep_rough': ['structural_concrete', 'drywall'],
+            'mep_finish': ['mep_rough', 'drywall'],
+            'drywall': ['mep_rough', 'insulation'],
+            'flooring': ['drywall'],
+            'painting': ['drywall'],
+            'waterproofing_below': ['excavation', 'blinding'],
+            'waterproofing_above': ['structural_concrete', 'roofing'],
+            'insulation': ['mep_rough'],
+            'testing': ['mep_finish'],
+            'commissioning': ['testing'],
+            'landscaping': ['backfilling'],
+            'final_inspection': ['commissioning', 'painting', 'flooring']
+        }
+        
+        # Check each activity for sequence violations
+        for i, (activity, phase) in enumerate(zip(activity_texts, phases)):
+            activity_lower = activity.lower()
+            
+            # Skip unknown phases
+            if phase == 'unknown':
+                continue
+            
+            # Get dependencies for this phase
+            dependencies = critical_dependencies.get(phase, [])
+            
+            # Check if all dependencies are met
+            for dep_phase in dependencies:
+                if dep_phase in phase_positions:
+                    # Check if current activity comes before its dependency
+                    dep_positions = phase_positions[dep_phase]
+                    if dep_positions and i < max(dep_positions):
+                        # Found a violation
+                        dep_activity_names = [activity_texts[pos] for pos in dep_positions]
+                        issues[i] = {
+                            'reason': f'{activity} must come after {dep_phase.replace("_", " ").title()} activities (found: {", ".join(dep_activity_names[-2:])})',
+                            'severity': 'high',
+                            'dependency': dep_phase
+                        }
+                        break
+            
+            # Additional specific checks based on activity keywords
+            if not i in issues:  # Only check if no issue found yet
+                
+                # Permits must be first
+                if phase == 'permits_approvals':
+                    non_permit_before = [j for j in range(i) if phases[j] != 'permits_approvals']
+                    if non_permit_before:
+                        issues[i] = {
+                            'reason': 'Permits and approvals must be obtained before any construction work begins',
+                            'severity': 'critical'
+                        }
+                
+                # HVAC/MEP finish should not be too early
+                elif phase == 'mep_finish':
+                    struct_phases = ['structural_steel', 'structural_concrete', 'masonry']
+                    struct_exists = any(p in phase_positions for p in struct_phases)
+                    if struct_exists:
+                        struct_max = max([max(phase_positions.get(p, [-1])) for p in struct_phases])
+                        if i < struct_max:
+                            issues[i] = {
+                                'reason': 'MEP finish work (HVAC, electrical, plumbing) must come after structural work is complete',
+                                'severity': 'high'
+                            }
+                
+                # Concrete pouring specific checks
+                elif 'pour' in activity_lower or 'cast' in activity_lower or 'concrete place' in activity_lower:
+                    # Check for formwork
+                    if 'formwork' in phase_positions and phase_positions['formwork']:
+                        if i < max(phase_positions['formwork']):
+                            issues[i] = {
+                                'reason': 'Concrete pouring requires formwork to be completed first',
+                                'severity': 'high'
+                            }
+                    # Check for rebar
+                    if 'rebar' in phase_positions and phase_positions['rebar']:
+                        if i < max(phase_positions['rebar']):
+                            issues[i] = {
+                                'reason': 'Concrete pouring requires reinforcement (rebar) to be installed first',
+                                'severity': 'high'
+                            }
+                
+                # Waterproofing checks
+                elif 'waterproof' in activity_lower:
+                    if 'below' in activity_lower or 'foundation' in activity_lower:
+                        if 'excavation' in phase_positions and phase_positions['excavation']:
+                            if i < max(phase_positions['excavation']):
+                                issues[i] = {
+                                    'reason': 'Below-grade waterproofing must come after excavation is complete',
+                                    'severity': 'high'
+                                }
+        
+        return issues
+    
+    def _check_duplicates(self, schedule_df, activity_col):
+        """Check for duplicate activity names in the schedule"""
+        activity_names = schedule_df[activity_col].astype(str).tolist()
+        
+        # Find duplicates
+        seen = {}
+        duplicates_found = []
+        
+        for idx, name in enumerate(activity_names):
+            if name in seen:
+                if name not in [d['name'] for d in duplicates_found]:
+                    duplicates_found.append({
+                        'name': name,
+                        'first_occurrence': seen[name] + 1,  # 1-based indexing
+                        'duplicate_rows': [seen[name] + 1, idx + 1]
+                    })
+                else:
+                    # Add to existing duplicate entry
+                    for dup in duplicates_found:
+                        if dup['name'] == name:
+                            dup['duplicate_rows'].append(idx + 1)
+                            break
+            else:
+                seen[name] = idx
+        
+        # Get activity IDs for duplicates if available
+        activity_id_col = None
+        for col in ['Activity ID', 'Activity_ID', 'Task ID', 'Task_ID']:
+            if col in schedule_df.columns:
+                activity_id_col = col
+                break
+        
+        if activity_id_col and duplicates_found:
+            for dup in duplicates_found:
+                dup['activity_ids'] = [
+                    str(schedule_df.iloc[row-1][activity_id_col]) 
+                    for row in dup['duplicate_rows']
+                ]
+        
+        return {
+            'has_duplicates': len(duplicates_found) > 0,
+            'duplicate_count': len(duplicates_found),
+            'duplicates': duplicates_found,
+            'total_activities': len(activity_names)
         }
     
     def _infer_phases(self, activity_texts):
-        """Infer phases from activity names"""
+        """Comprehensive phase inference from activity names"""
         phases = []
         for activity in activity_texts:
             activity_lower = activity.lower()
             
-            if 'permit' in activity_lower or 'approval' in activity_lower:
+            # Permits and Approvals (Priority 1)
+            if any(kw in activity_lower for kw in ['permit', 'approval', 'license', 'authorization', 'clearance']):
                 phases.append('permits_approvals')
-            elif 'site' in activity_lower or 'clearing' in activity_lower or 'survey' in activity_lower:
+            
+            # Site Preparation (Priority 2)
+            elif any(kw in activity_lower for kw in ['site prep', 'site clear', 'grubbing', 'temporary fence', 'site access', 'mobilization']):
                 phases.append('site_preparation')
-            elif 'excavation' in activity_lower or 'trenching' in activity_lower:
+            
+            # Demolition (Priority 3)
+            elif any(kw in activity_lower for kw in ['demolition', 'demolish', 'removal', 'strip out']):
+                phases.append('demolition')
+            
+            # Surveying (Priority 4)
+            elif any(kw in activity_lower for kw in ['survey', 'layout', 'marking', 'stake out', 'benchmark']):
+                phases.append('surveying')
+            
+            # Excavation (Priority 5)
+            elif any(kw in activity_lower for kw in ['excavat', 'earthwork', 'cut', 'dig', 'trenching', 'grading', 'earth moving']):
                 phases.append('excavation')
-            elif 'foundation' in activity_lower or 'footing' in activity_lower:
+            
+            # Shoring and Support (Priority 6)
+            elif any(kw in activity_lower for kw in ['shoring', 'sheet pil', 'bracing', 'underpinning', 'soil nail']):
+                phases.append('shoring')
+            
+            # Dewatering (Priority 7)
+            elif any(kw in activity_lower for kw in ['dewater', 'wellpoint', 'sump pump', 'water table']):
+                phases.append('dewatering')
+            
+            # Piling (Priority 8)
+            elif any(kw in activity_lower for kw in ['piling', 'pile', 'caisson', 'driven pile', 'bored pile', 'micropile']):
+                phases.append('piling')
+            
+            # Blinding/Lean Concrete (Priority 9)
+            elif any(kw in activity_lower for kw in ['blinding', 'lean concrete', 'mud mat', 'screed']):
+                phases.append('blinding')
+            
+            # Waterproofing Below Grade (Priority 10)
+            elif 'waterproof' in activity_lower and any(kw in activity_lower for kw in ['foundation', 'basement', 'below', 'membrane']):
+                phases.append('waterproofing_below')
+            
+            # Formwork (Priority 11)
+            elif any(kw in activity_lower for kw in ['formwork', 'shuttering', 'forms', 'falsework', 'centering']):
+                phases.append('formwork')
+            
+            # Rebar/Reinforcement (Priority 12)
+            elif any(kw in activity_lower for kw in ['rebar', 'reinforc', 'steel bar', 'mesh', 'stirrup', 'dowel']):
+                phases.append('rebar')
+            
+            # Foundation/Concrete (Priority 13)
+            elif any(kw in activity_lower for kw in ['foundation', 'footing', 'raft', 'mat foundation', 'pile cap']) or \
+                 ('concrete' in activity_lower and any(kw in activity_lower for kw in ['pour', 'cast', 'place'])):
                 phases.append('foundation')
-            elif 'structural' in activity_lower or 'column' in activity_lower or 'beam' in activity_lower:
-                phases.append('structural')
-            elif 'electrical' in activity_lower:
-                phases.append('electrical')
-            elif 'plumbing' in activity_lower or 'pipe' in activity_lower:
-                phases.append('plumbing')
-            elif 'finishing' in activity_lower or 'painting' in activity_lower or 'flooring' in activity_lower:
-                phases.append('finishing')
+            
+            # Backfilling (Priority 14)
+            elif any(kw in activity_lower for kw in ['backfill', 'compaction', 'fill', 'soil replacement']):
+                phases.append('backfilling')
+            
+            # Structural Steel (Priority 15)
+            elif any(kw in activity_lower for kw in ['steel erection', 'structural steel', 'steel frame', 'metal deck', 'steel beam', 'steel column']):
+                phases.append('structural_steel')
+            
+            # Structural Concrete (Priority 16)
+            elif any(kw in activity_lower for kw in ['slab', 'beam', 'column', 'core wall', 'shear wall']) and \
+                 not any(kw in activity_lower for kw in ['steel', 'metal']):
+                phases.append('structural_concrete')
+            
+            # Masonry (Priority 17)
+            elif any(kw in activity_lower for kw in ['masonry', 'brick', 'block', 'cmu', 'stone work', 'mortar']):
+                phases.append('masonry')
+            
+            # Roofing (Priority 18)
+            elif any(kw in activity_lower for kw in ['roof', 'parapet', 'coping', 'flashing', 'membrane roof']):
+                phases.append('roofing')
+            
+            # Waterproofing Above Grade (Priority 19)
+            elif 'waterproof' in activity_lower and not any(kw in activity_lower for kw in ['foundation', 'basement', 'below']):
+                phases.append('waterproofing_above')
+            
+            # Curtain Wall/Facade (Priority 20)
+            elif any(kw in activity_lower for kw in ['curtain wall', 'facade', 'cladding', 'exterior panel', 'glazing', 'window', 'storefront']):
+                phases.append('curtain_wall')
+            
+            # MEP Rough-in (Priority 21)
+            elif any(kw in activity_lower for kw in ['rough-in', 'rough in', 'sleeve', 'conduit', 'ductwork', 'pipe rough']) or \
+                 ('hvac' in activity_lower or 'mechanical' in activity_lower or 'electrical' in activity_lower or 'plumbing' in activity_lower) and \
+                 'rough' in activity_lower:
+                phases.append('mep_rough')
+            
+            # HVAC/Mechanical (Priority 22)
+            elif any(kw in activity_lower for kw in ['hvac', 'ducting', 'ventilation', 'air handling', 'chiller', 'boiler', 'mechanical equip']):
+                phases.append('mep_finish')
+            
+            # Electrical (Priority 23)
+            elif any(kw in activity_lower for kw in ['electrical', 'wiring', 'cable', 'panel', 'switchgear', 'transformer', 'lighting']):
+                phases.append('mep_finish')
+            
+            # Plumbing (Priority 24)
+            elif any(kw in activity_lower for kw in ['plumbing', 'pipe', 'sanitary', 'storm drain', 'water supply', 'fixture']):
+                phases.append('mep_finish')
+            
+            # Fire Protection (Priority 25)
+            elif any(kw in activity_lower for kw in ['fire protection', 'sprinkler', 'fire alarm', 'fire pump']):
+                phases.append('mep_finish')
+            
+            # Insulation (Priority 26)
+            elif any(kw in activity_lower for kw in ['insulation', 'thermal', 'acoustic', 'fireproofing']):
+                phases.append('insulation')
+            
+            # Drywall/Interior Walls (Priority 27)
+            elif any(kw in activity_lower for kw in ['drywall', 'gypsum', 'partition', 'interior wall', 'framing']):
+                phases.append('drywall')
+            
+            # Flooring (Priority 28)
+            elif any(kw in activity_lower for kw in ['flooring', 'tile', 'carpet', 'vinyl', 'hardwood', 'epoxy floor']):
+                phases.append('flooring')
+            
+            # Painting (Priority 29)
+            elif any(kw in activity_lower for kw in ['paint', 'primer', 'coating', 'finish']):
+                phases.append('painting')
+            
+            # Testing (Priority 30)
+            elif any(kw in activity_lower for kw in ['test', 'inspection', 'check', 'verify']):
+                phases.append('testing')
+            
+            # Commissioning (Priority 31)
+            elif any(kw in activity_lower for kw in ['commission', 'startup', 'balancing', 'tab', 'handover']):
+                phases.append('commissioning')
+            
+            # Landscaping (Priority 32)
+            elif any(kw in activity_lower for kw in ['landscape', 'planting', 'irrigation', 'hardscape', 'paving']):
+                phases.append('landscaping')
+            
+            # Final Activities (Priority 33)
+            elif any(kw in activity_lower for kw in ['final inspection', 'punch list', 'certificate of occupancy', 'closeout']):
+                phases.append('final_inspection')
+            
             else:
                 phases.append('unknown')
         
         return phases
     
     def _generate_correction(self, activity_name, phase, current_position):
-        """Generate correction details"""
+        """Generate correction details with proper construction sequencing"""
         activity_lower = activity_name.lower()
         
         violation_type = 'sequence_anomaly'
         suggested_position = current_position
         
+        # Check for specific violations based on activity type and phase
         if 'permit' in activity_lower:
             violation_type = 'permit_after_work'
             suggested_position = 1
-        elif 'foundation' in activity_lower:
-            violation_type = 'foundation_before_excavation'
-            suggested_position = max(1, current_position + 3)
+        elif 'hvac' in activity_lower or 'ducting' in activity_lower:
+            # HVAC should come after structural work
+            violation_type = 'hvac_before_structure'
+            suggested_position = max(current_position, 15)  # After structural work
+        elif 'backfill' in activity_lower or 'compaction' in activity_lower:
+            # Backfilling should come after foundation/concrete work
+            violation_type = 'backfilling_before_foundation'
+            suggested_position = max(current_position, 10)  # After foundation work
+        elif 'formwork' in activity_lower or 'shuttering' in activity_lower:
+            # Formwork needs excavation first
+            if current_position < 3:
+                violation_type = 'formwork_before_excavation'
+                suggested_position = 4  # After excavation
+        elif 'foundation' in activity_lower or 'concrete' in activity_lower:
+            # Foundation/concrete needs excavation and formwork first
+            if current_position < 5:
+                violation_type = 'foundation_before_excavation'
+                suggested_position = 6  # After formwork
+        elif 'excavation' in activity_lower:
+            # Excavation should be early in the sequence
+            if current_position > 3:
+                violation_type = 'sequence_anomaly'
+                suggested_position = 2  # Early position
         elif 'testing' in activity_lower or 'commissioning' in activity_lower:
             violation_type = 'testing_before_installation'
             suggested_position = current_position + 2
@@ -448,9 +936,9 @@ class LSTMCompleteP6Analyzer:
             suggested_position = current_position + 1
         elif 'finishing' in activity_lower or 'painting' in activity_lower:
             violation_type = 'finishing_before_structure'
-            suggested_position = current_position + 5
+            suggested_position = max(current_position, 20)
         
-        template = self.correction_templates.get(violation_type)
+        template = self.correction_templates.get(violation_type, self.correction_templates['sequence_anomaly'])
         
         return {
             'violation_type': str(violation_type),
@@ -616,14 +1104,19 @@ HTML_TEMPLATE = """
 
             showLoading();
             
+            // Use longer timeout for large files
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minute timeout
+            
             fetch('/analyze', {
                 method: 'POST',
-                body: formData
+                body: formData,
+                signal: controller.signal
             })
             .then(response => response.json())
             .then(data => {
                 if (data.error) {
-                    showError(data.error);
+                    showError(data.error, data);
                 } else {
                     displayResults(data);
                 }
@@ -655,7 +1148,7 @@ HTML_TEMPLATE = """
             .then(response => response.json())
             .then(data => {
                 if (data.error) {
-                    showError(data.error);
+                    showError(data.error, data);
                 } else {
                     displayResults(data);
                 }
@@ -663,14 +1156,32 @@ HTML_TEMPLATE = """
             .catch(error => showError('Error: ' + error.message));
         }
 
-        function showLoading() {
+        function showLoading(fileSize) {
             const resultsDiv = document.getElementById('results');
             resultsDiv.style.display = 'block';
+            
+            let message = 'Generating training data, training LSTM model, and analyzing your schedule...';
+            if (fileSize && fileSize > 100) {
+                message = `Processing large schedule (${fileSize} activities). This may take 1-3 minutes...`;
+            }
+            
             resultsDiv.innerHTML = `
                 <div class="loading">
                     <h3>🧠 LSTM Neural Network Processing...</h3>
-                    <p>Generating training data, training LSTM model, and analyzing your schedule...</p>
-                </div>`;
+                    <p>${message}</p>
+                    <div style="margin-top: 1rem;">
+                        <div style="width: 200px; height: 4px; background: #e0e0e0; border-radius: 2px; margin: 0 auto;">
+                            <div style="width: 50%; height: 100%; background: #4299e1; border-radius: 2px; animation: progress 2s ease-in-out infinite;"></div>
+                        </div>
+                    </div>
+                </div>
+                <style>
+                    @keyframes progress {
+                        0% { width: 0%; }
+                        50% { width: 100%; }
+                        100% { width: 0%; }
+                    }
+                </style>`;
         }
 
         function displayResults(data) {
@@ -678,6 +1189,25 @@ HTML_TEMPLATE = """
             resultsDiv.style.display = 'block';
             
             let html = '';
+            
+            // Duplicate warning
+            if (data.analysis && data.analysis.duplicate_warning) {
+                const dupWarn = data.analysis.duplicate_warning;
+                html += `
+                    <div class="error" style="background: #fff3cd; border-color: #ffc107; color: #856404;">
+                        <h4>⚠️ Duplicate Activities Detected</h4>
+                        <p>${dupWarn.message}</p>
+                        <p><strong>Found ${dupWarn.total_duplicates} duplicate activity name(s):</strong></p>
+                        <ul style="margin-top: 0.5rem;">`;
+                
+                dupWarn.duplicates.forEach(dup => {
+                    html += `<li>"${dup.name}" appears ${dup.duplicate_rows.length} times (rows: ${dup.duplicate_rows.join(', ')})</li>`;
+                });
+                
+                html += `</ul>
+                        <p style="font-style: italic; margin-top: 0.5rem;">Activities have been automatically numbered (#2, #3, etc.) for analysis.</p>
+                    </div>`;
+            }
             
             // Training info
             if (data.training_info) {
@@ -733,9 +1263,31 @@ HTML_TEMPLATE = """
                         </thead>
                         <tbody>`;
             
+            // Check if results are truncated for large schedules
+            if (data.analysis && data.analysis.is_truncated) {
+                html += `
+                    <div style="background: #e6f3ff; padding: 1rem 2rem; border: 1px solid #4299e1; margin: 0 2rem 1rem;">
+                        <h4>📊 Large Schedule Notice</h4>
+                        <p>Showing first ${data.analysis.displayed_count} of ${data.analysis.all_results_count} activities.</p>
+                        <p>All ${data.analysis.all_results_count} activities were analyzed. See summary above for complete statistics.</p>
+                    </div>`;
+            }
+            
             // Results rows
             if (data.analysis && data.analysis.results) {
-                data.analysis.results.forEach(result => {
+                // Only show issues for very large schedules
+                const resultsToShow = data.analysis.all_results_count > 200 
+                    ? data.analysis.results.filter(r => !r.is_correct)
+                    : data.analysis.results;
+                
+                if (data.analysis.all_results_count > 200 && resultsToShow.length < data.analysis.results.length) {
+                    html += `
+                        <div style="padding: 0.5rem 2rem; background: #fffacd;">
+                            <p>ℹ️ Showing only activities with issues (${resultsToShow.length} of ${data.analysis.displayed_count})</p>
+                        </div>`;
+                }
+                
+                resultsToShow.forEach(result => {
                     const flagClass = result.is_correct ? 'flag-correct' : 'flag-incorrect';
                     const flagIcon = result.is_correct ? '🟢' : '🔴';
                     const flagText = result.is_correct ? '' : '🚩';
@@ -772,10 +1324,40 @@ HTML_TEMPLATE = """
             resultsDiv.innerHTML = html;
         }
 
-        function showError(message) {
+        function showError(message, details) {
             const resultsDiv = document.getElementById('results');
             resultsDiv.style.display = 'block';
-            resultsDiv.innerHTML = `<div class="error"><h3>❌ Error</h3><p>${message}</p></div>`;
+            
+            let errorHtml = `<div class="error"><h3>❌ Error</h3><p>${message}</p>`;
+            
+            // If duplicate details are provided
+            if (details && details.duplicate_details) {
+                const dupInfo = details.duplicate_details;
+                errorHtml += `
+                    <div style="margin-top: 1rem;">
+                        <h4>Duplicate Activity Names Found:</h4>
+                        <p>Total Activities: ${dupInfo.total_activities} | Duplicates Found: ${dupInfo.duplicate_count}</p>
+                        <ul style="margin-top: 0.5rem;">`;
+                
+                dupInfo.duplicates.forEach(dup => {
+                    errorHtml += `<li><strong>"${dup.name}"</strong> appears in rows: ${dup.duplicate_rows.join(', ')}`;
+                    if (dup.activity_ids) {
+                        errorHtml += ` (IDs: ${dup.activity_ids.join(', ')})`;
+                    }
+                    errorHtml += `</li>`;
+                });
+                
+                errorHtml += `
+                        </ul>
+                        <p style="margin-top: 1rem; font-style: italic;">
+                            Please ensure all activity names are unique. Consider adding location identifiers, 
+                            phase numbers, or other distinguishing details to make each activity name unique.
+                        </p>
+                    </div>`;
+            }
+            
+            errorHtml += `</div>`;
+            resultsDiv.innerHTML = errorHtml;
         }
 
         function exportResults() {
@@ -845,6 +1427,13 @@ def analyze_everything_lstm():
         analysis_results = analyzer.analyze_schedule(user_schedule)
         
         if 'error' in analysis_results:
+            # Special handling for duplicate errors
+            if 'duplicate_details' in analysis_results:
+                return jsonify({
+                    'error': analysis_results['error'],
+                    'message': analysis_results['message'],
+                    'duplicate_details': analysis_results['duplicate_details']
+                }), 400
             return jsonify({'error': analysis_results['error']}), 400
         
         # Calculate processing time
@@ -898,5 +1487,12 @@ if __name__ == '__main__':
     print("   3️⃣ Analyzes your uploaded schedule with LSTM")
     print("   4️⃣ Returns complete analysis with LSTM predictions")
     print("=" * 60)
+    print("📊 CAPACITY:")
+    print("   • Supports up to 1000 activities per schedule")
+    print("   • Automatic batching for schedules > 100 activities")
+    print("   • Handles duplicate activity names with warnings")
+    print("=" * 60)
     
-    app.run(debug=True, host='0.0.0.0', port=8080)
+    # Increase timeout for large schedules
+    app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+    app.run(debug=True, host='0.0.0.0', port=8080, threaded=True)
